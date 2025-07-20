@@ -7,8 +7,15 @@ import java.util.regex.*;
 
 public class MultiThreadedDownloader {
 
-    private static final int THREAD_COUNT = 4; // Increase for faster downloads
+    private static final int THREAD_COUNT = 4; // Adjust as needed
     private static final int BUFFER_SIZE = 8192;
+
+    public static void main(String[] args) throws Exception {
+        String fileURL = "https://example.com/largefile.zip"; // Replace with your URL
+        String outputDir = System.getProperty("user.home") + File.separator + "Downloads";
+
+        new MultiThreadedDownloader().downloadFile(fileURL, outputDir);
+    }
 
     public void downloadFile(String fileURL, String outputDir) throws Exception {
         URL url = new URL(fileURL);
@@ -16,6 +23,9 @@ public class MultiThreadedDownloader {
         conn.setRequestMethod("HEAD");
 
         long contentLength = conn.getContentLengthLong();
+        if (contentLength <= 0) {
+            throw new IOException("Could not get content length from server.");
+        }
         String fileName = detectFileName(conn, fileURL);
         conn.disconnect();
 
@@ -37,20 +47,30 @@ public class MultiThreadedDownloader {
 
             File partFile = new File(outputDir, fileName + ".part" + threadIndex);
             long existingSize = partFile.exists() ? partFile.length() : 0;
-            long finalStart = startByte + existingSize;
 
-            int finalThreadIndex = i;
+            long totalPartSize = endByte - startByte + 1;
+            downloadedPerThread[i] = Math.min(existingSize, totalPartSize);
+
+            long finalStart = startByte + downloadedPerThread[i];
+
+            if (downloadedPerThread[i] >= totalPartSize) {
+                // Part fully downloaded, skip and count down latch
+                latch.countDown();
+                System.out.println("Part " + threadIndex + " already downloaded.");
+                continue;
+            }
+
             executor.submit(() -> {
                 try {
-                    downloadPart(fileURL, partFile, finalStart, endByte, downloadedPerThread, finalThreadIndex);
+                    downloadPart(fileURL, partFile, finalStart, endByte, downloadedPerThread, threadIndex);
                 } catch (IOException e) {
-                    System.err.println("Thread " + finalThreadIndex + " error: " + e.getMessage());
+                    System.err.println("Thread " + threadIndex + " error: " + e.getMessage());
                 }
                 latch.countDown();
             });
         }
 
-        // Progress Monitor
+        // Progress Monitor Thread
         new Thread(() -> {
             long previousDownloaded = 0;
             long previousTime = System.currentTimeMillis();
@@ -64,7 +84,7 @@ public class MultiThreadedDownloader {
                 long bytesDiff = totalDownloaded - previousDownloaded;
 
                 if (timeDiff >= 1000) {
-                    double speedBps = bytesDiff / (timeDiff / 1000.0); // bytes/sec
+                    double speedBps = bytesDiff / (timeDiff / 1000.0);
                     double speedMBps = speedBps / (1024.0 * 1024.0);
                     double percent = (totalDownloaded * 100.0) / contentLength;
 
@@ -95,9 +115,14 @@ public class MultiThreadedDownloader {
     private void downloadPart(String fileURL, File partFile, long start, long end, long[] downloaded, int index) throws IOException {
         HttpURLConnection conn = (HttpURLConnection) new URL(fileURL).openConnection();
         conn.setRequestProperty("Range", "bytes=" + start + "-" + end);
+        int responseCode = conn.getResponseCode();
+        if (responseCode != HttpURLConnection.HTTP_PARTIAL && responseCode != HttpURLConnection.HTTP_OK) {
+            throw new IOException("Server does not support partial content. Response code: " + responseCode);
+        }
+
         try (InputStream in = conn.getInputStream();
              RandomAccessFile raf = new RandomAccessFile(partFile, "rw")) {
-            raf.seek(partFile.length());
+            raf.seek(partFile.length()); // resume where left off
 
             byte[] buffer = new byte[BUFFER_SIZE];
             int read;
@@ -105,6 +130,8 @@ public class MultiThreadedDownloader {
                 raf.write(buffer, 0, read);
                 downloaded[index] += read;
             }
+        } finally {
+            conn.disconnect();
         }
     }
 
@@ -119,7 +146,9 @@ public class MultiThreadedDownloader {
                         bos.write(buffer, 0, read);
                     }
                 }
-                part.delete(); // delete part after merging
+                if (!part.delete()) {
+                    System.err.println("Failed to delete part file: " + part.getAbsolutePath());
+                }
             }
         }
     }
